@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Search, Youtube, Menu, Home, Compass, PlaySquare, Clock, ThumbsUp, Share2, MoreVertical, Bell, User, Loader2, Sparkles } from 'lucide-react';
-import { GoogleGenAI } from "@google/genai";
+// Use server-side AI proxy instead of direct SDK
 
 interface VideoItem {
     id: string;
@@ -32,17 +32,19 @@ export const CinemaHub: React.FC = () => {
         setActiveVideoId(null);
 
         try {
-            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-            const response = await ai.models.generateContent({
-                model: 'gemini-3-flash-preview',
-                contents: `Search YouTube for: "${finalQuery}". List exactly 12 relevant video titles and their YouTube Video IDs. Return ONLY a valid JSON array of objects with keys: id, title, channel, views, time. Example: {"id": "dQw4w9WgXcQ", "title": "Example Video", "channel": "Learn Academy", "views": "1.2M", "time": "2 days ago"}`,
-                config: { 
-                    responseMimeType: "application/json",
-                    tools: [{ googleSearch: {} }] 
-                }
-            });
-
-            const data = JSON.parse(response.text || "[]");
+                const token = (typeof localStorage !== 'undefined') ? localStorage.getItem('token') : null;
+                const payload = {
+                    prompt: `Search YouTube for: "${finalQuery}". List exactly 12 relevant video titles and their YouTube Video IDs. Return ONLY a valid JSON array of objects with keys: id, title, channel, views, time. Example: {\"id\": \"dQw4w9WgXcQ\", \"title\": \"Example Video\", \"channel\": \"Learn Academy\", \"views\": \"1.2M\", \"time\": \"2 days ago\"}`,
+                    model: 'gemini-3-flash-preview',
+                    config: { responseMimeType: 'application/json', tools: [{ googleSearch: {} }] }
+                };
+                const res = await fetch('/api/ai/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+                    body: JSON.stringify(payload)
+                });
+                const json = await res.json();
+                const data = JSON.parse(json.text || '[]');
             const processed = data.map((v: any) => ({
                 ...v,
                 thumbnail: `https://img.youtube.com/vi/${v.id}/maxresdefault.jpg`

@@ -1,5 +1,7 @@
 
-import { GoogleGenAI, Type, Modality } from "@google/genai";
+// Lightweight client-side shim: forward AI calls to server-side proxy
+const Type: any = { ARRAY: 'array', OBJECT: 'object', STRING: 'string', NUMBER: 'number' };
+const Modality: any = { AUDIO: 'audio' };
 import { 
   Language, Subject, EducationLevel, ExamQuestion, Presentation, 
   CloudInsight, GeoResult, NewsItem, Fact, DeepDiveArticle, 
@@ -8,10 +10,60 @@ import {
   CompetitionTopic, ModelPaper, GradedPaperResult 
 } from "../types";
 import { dbService } from "./dbService";
+import { multiAIService } from "./multiAIService";
 // Fix: Added missing SAVED_PLANS and COMPETITION_DB imports
 import { SAVED_ARTICLES, SAVED_NEWS, SAVED_QUIZ, SAVED_FACTS, SAVED_PLANS, COMPETITION_DB } from "../data/permanentDB";
 
-const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+const getAI = () => {
+    const callServer = async (body: any) => {
+        const token = (typeof localStorage !== 'undefined') ? localStorage.getItem('token') : null;
+        const headers: any = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const res = await fetch('/api/ai/generate', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`AI proxy error ${res.status}: ${text}`);
+        }
+        return res.json();
+    };
+
+    return {
+        models: {
+            generateContent: async ({ model, contents, config }: any) => {
+                const payload = { prompt: contents, model, config };
+                const data = await callServer(payload);
+                return { text: data.text || '', candidates: data.candidates || [], raw: data.raw || data };
+            },
+            generateContentStream: async ({ model, contents }: any) => {
+                const payload = { prompt: contents, model };
+                const data = await callServer(payload);
+                const text = data.text || '';
+                async function* gen() {
+                    const chunkSize = 60;
+                    for (let i = 0; i < text.length; i += chunkSize) {
+                        yield { text: text.slice(i, i + chunkSize) };
+                        await new Promise(r => setTimeout(r, 8));
+                    }
+                }
+                return gen();
+            },
+            generateVideos: async ({ model, prompt, config }: any) => {
+                const payload = { prompt, model, config, type: 'video' };
+                return callServer(payload);
+            }
+        },
+        operations: {
+            getVideosOperation: async ({ operation }: any) => ({ done: true, response: operation })
+        },
+        live: {
+            connect: async () => { throw new Error('Live connections must use server-side implementation'); }
+        }
+    };
+};
 
 export const getLangInstruction = (lang: Language) => {
   return lang === 'hi' ? "IMPORTANT: Respond EXCLUSIVELY in Hindi (Devanagari script)." : "Respond in English.";
@@ -31,14 +83,35 @@ export const getGeminiResponse = async (prompt: string, lang: Language): Promise
     const cached = dbService.getSavedResult('chat_resp', prompt);
     if (cached) return cached;
 
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `${prompt} ${getLangInstruction(lang)}`,
-    });
-    const result = response.text || "";
-    dbService.saveResult('chat_resp', prompt, result);
-    return result;
+    try {
+        // Try Gemini first
+        const ai = getAI();
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: `${prompt} ${getLangInstruction(lang)}`,
+        });
+        const result = response.text || "";
+        if (result) {
+            dbService.saveResult('chat_resp', prompt, result);
+            return result;
+        }
+    } catch (error: any) {
+        console.warn("Gemini API failed:", error?.message);
+        // Fallback to multiAIService if Gemini fails
+    }
+
+    // Automatic fallback to multi-AI service
+    try {
+        const multiResponse = await multiAIService.generateResponse(prompt, lang);
+        dbService.saveResult('chat_resp', prompt, multiResponse);
+        return multiResponse;
+    } catch (fallbackError) {
+        console.error("All AI services failed:", fallbackError);
+        // Return graceful error message
+        return lang === 'hi' 
+            ? "माफ़ करें, अभी AI सेवा उपलब्ध नहीं है। कृपया कुछ समय बाद पुनः प्रयास करें।"
+            : "Sorry, AI service is temporarily unavailable. Please try again later.";
+    }
 };
 
 export const fetchNews = async (lang: Language, refresh: boolean = false): Promise<NewsItem[]> => {
@@ -609,12 +682,41 @@ export const performGlobalSearch = async (query: string, lang: Language) => {
 };
 
 export async function* streamGeminiResponse(prompt: string) {
-    const ai = getAI();
-    const response = await ai.models.generateContentStream({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-    });
-    for await (const chunk of response) yield chunk.text || "";
+    try {
+        // Try Gemini streaming first
+        const ai = getAI();
+        const response = await ai.models.generateContentStream({
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+        });
+        let hasContent = false;
+        for await (const chunk of response) {
+            const text = chunk.text || "";
+            if (text) {
+                hasContent = true;
+                yield text;
+            }
+        }
+        if (hasContent) return;
+    } catch (error: any) {
+        console.warn("Gemini streaming failed:", error?.message);
+        // Fallback to multiAIService if Gemini fails
+    }
+
+    // Automatic fallback to multi-AI service (yield response in chunks)
+    try {
+        const multiResponse = await multiAIService.generateResponse(prompt, 'en');
+        // Yield response in reasonable chunks for streaming effect
+        const chunkSize = 50;
+        for (let i = 0; i < multiResponse.length; i += chunkSize) {
+            yield multiResponse.substring(i, i + chunkSize);
+            // Small delay to simulate streaming
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+    } catch (fallbackError) {
+        console.error("All streaming services failed:", fallbackError);
+        yield "Sorry, streaming service temporarily unavailable. Please retry.";
+    }
 }
 
 export const generateSpeech = async (text: string, voice: string): Promise<string | null> => {
